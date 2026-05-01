@@ -58,6 +58,18 @@ db.run(`
   )
 `);
 
+// Idempotent migration: add 'pushed' column on existing databases.
+// 'pushed' decouples the auto-push loop's drain from the manual fallback's
+// drain. Without this, /poll-messages marked delivered=1 at first call
+// (whether from auto-push or check_messages), so on hosts that drop
+// claude/channel notifications (Antigravity, Zed, CLI without
+// --dangerously-load-development-channels), the manual check_messages
+// always saw an empty queue.
+const messagesCols = db.query("PRAGMA table_info(messages)").all() as { name: string }[];
+if (!messagesCols.some((c) => c.name === "pushed")) {
+  db.run("ALTER TABLE messages ADD COLUMN pushed INTEGER NOT NULL DEFAULT 0");
+}
+
 // Clean up stale peers (PIDs that no longer exist) on startup
 function cleanStalePeers() {
   const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
@@ -118,8 +130,18 @@ const selectUndelivered = db.prepare(`
   SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC
 `);
 
+// Auto-push loop reads via selectUnpushed; check_messages tool (manual
+// fallback) reads via selectUndelivered. Two flags, two consumers.
+const selectUnpushed = db.prepare(`
+  SELECT * FROM messages WHERE to_id = ? AND pushed = 0 AND delivered = 0 ORDER BY sent_at ASC
+`);
+
 const markDelivered = db.prepare(`
   UPDATE messages SET delivered = 1 WHERE id = ?
+`);
+
+const markPushed = db.prepare(`
+  UPDATE messages SET pushed = 1 WHERE id = ?
 `);
 
 // --- Generate peer ID ---
@@ -219,6 +241,21 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   return { messages };
 }
 
+// Auto-push consumer: reads only rows that have not been pushed yet.
+// Marks pushed=1 so subsequent push-polls don't re-emit. Does NOT touch
+// delivered=0, so the manual check_messages fallback can still drain
+// them via /poll-messages if the channel notification was dropped at
+// host level.
+function handlePushPollMessages(body: PollMessagesRequest): PollMessagesResponse {
+  const messages = selectUnpushed.all(body.id) as Message[];
+
+  for (const msg of messages) {
+    markPushed.run(msg.id);
+  }
+
+  return { messages };
+}
+
 function handleUnregister(body: { id: string }): void {
   deletePeer.run(body.id);
 }
@@ -257,6 +294,8 @@ Bun.serve({
           return Response.json(handleSendMessage(body as SendMessageRequest));
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
+        case "/push-poll-messages":
+          return Response.json(handlePushPollMessages(body as PollMessagesRequest));
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });
