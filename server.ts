@@ -31,6 +31,9 @@ import {
   getGitBranch,
   getRecentFiles,
 } from "./shared/summarize.ts";
+import { mkdir, writeFile, unlink } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 // --- Configuration ---
 
@@ -502,6 +505,20 @@ async function main() {
   myId = reg.id;
   log(`Registered as peer ${myId}`);
 
+  // Kloudify-integration: write a peer-id mapping file keyed by the host
+  // Claude process PID (= our process.ppid). The Kloudify peer-injector.sh
+  // hook is spawned by the host as a child, so its $PPID equals our ppid;
+  // it reads this file to learn its own peer_id and query the broker DB.
+  const mappingDir = join(homedir(), ".claude-peers", "by-claude-pid");
+  const mappingFile = join(mappingDir, `${process.ppid}.id`);
+  try {
+    await mkdir(mappingDir, { recursive: true });
+    await writeFile(mappingFile, myId, "utf8");
+    log(`Peer mapping written: ${mappingFile} -> ${myId}`);
+  } catch (err) {
+    log(`Warning: failed to write peer mapping: ${err}`);
+  }
+
   // If summary generation is still running, update it when done
   if (!initialSummary) {
     summaryPromise.then(async () => {
@@ -545,6 +562,12 @@ async function main() {
       } catch {
         // Best effort
       }
+    }
+    // Kloudify-integration: best-effort cleanup of the peer-id mapping file.
+    try {
+      await unlink(mappingFile);
+    } catch {
+      // File may not exist (write failed earlier) — that's fine.
     }
     process.exit(0);
   };

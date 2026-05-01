@@ -10,6 +10,9 @@
  */
 
 import { Database } from "bun:sqlite";
+import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -25,6 +28,20 @@ import type {
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
+
+// Kloudify-integration: pending-flag directory. The broker touches
+// ~/.claude-peers/pending/<to_id> on every successful /send-message and
+// removes it when /poll-messages drains the inbox of a peer to zero
+// undelivered. The Kloudify peer-injector.sh hook tests for this file
+// existence as its fast-path before any DB access — so the cost of a
+// no-message UserPromptSubmit is one stat() call (~3-5ms) instead of
+// a full bun + sqlite open + query path (~80-150ms).
+const PENDING_DIR = join(homedir(), ".claude-peers", "pending");
+try {
+  mkdirSync(PENDING_DIR, { recursive: true });
+} catch {
+  // Best effort — flag is an optimization, not required for correctness.
+}
 
 // --- Database setup ---
 
@@ -252,6 +269,16 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
   }
 
   insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
+
+  // Kloudify-integration: touch the pending flag for the target peer.
+  // The hook fast-paths via [ -f $FLAG ] || exit 0, so this file's presence
+  // is the only signal needed to skip the full DB query path.
+  try {
+    writeFileSync(join(PENDING_DIR, body.to_id), "");
+  } catch {
+    // Best effort: flag is an optimization. Failure does not block the send.
+  }
+
   return { ok: true };
 }
 
@@ -261,6 +288,20 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   // Mark them as delivered
   for (const msg of messages) {
     markDelivered.run(msg.id);
+  }
+
+  // Kloudify-integration: if no undelivered remain for this peer, clear
+  // the pending flag so the hook fast-path stops triggering full bun+DB
+  // opens on every UserPromptSubmit.
+  const remaining = db.query(
+    "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivered = 0 AND expired_at IS NULL",
+  ).get(body.id) as { n: number };
+  if (remaining.n === 0) {
+    try {
+      unlinkSync(join(PENDING_DIR, body.id));
+    } catch {
+      // Flag may not exist (race or never-written); fine.
+    }
   }
 
   return { messages };
