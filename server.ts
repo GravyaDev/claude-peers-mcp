@@ -76,7 +76,12 @@ async function ensureBroker(): Promise<void> {
   }
 
   log("Starting broker daemon...");
-  const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
+  // Use process.execPath (absolute path to the running Bun binary) instead of
+  // the bare "bun" command. On Windows, MCP hosts spawn this server with a
+  // narrow PATH that does not let Bun.spawn resolve "bun" / "bun.exe" by name
+  // (ENOENT errno -4058), even when the installation directory is on PATH.
+  // process.execPath is cross-platform, installer-agnostic, and always set.
+  const proc = Bun.spawn([process.execPath, BROKER_SCRIPT], {
     stdio: ["ignore", "ignore", "inherit"],
     // Detach so the broker survives if this MCP server exits
     // On macOS/Linux, the broker will keep running
